@@ -261,6 +261,94 @@ func (mc *MetricsCollector) GetStats() map[string]interface{} {
 }
 
 // ──────────────────────────────────────────────
+// Auth Middleware
+// ──────────────────────────────────────────────
+
+func authMiddleware(password string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check session cookie first
+		cookie, err := r.Cookie("bastion_session")
+		if err == nil && cookie.Value == hashPassword(password) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Login page
+		if r.URL.Path == "/login" && r.Method == "POST" {
+			r.ParseForm()
+			if r.FormValue("password") == password {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "bastion_session",
+					Value:    hashPassword(password),
+					Path:     "/",
+					MaxAge:   86400 * 7, // 7 days
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+				})
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(loginHTML("Wrong password")))
+			return
+		}
+
+		if r.URL.Path == "/login" {
+			w.Write([]byte(loginHTML("")))
+			return
+		}
+
+		// Not authenticated — redirect to login
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	})
+}
+
+func hashPassword(pw string) string {
+	h := fmt.Sprintf("%x", pw+"bastion-salt-2026")
+	return h
+}
+
+const loginHTMLTemplate = `<!DOCTYPE html>
+<html>
+<head>
+<title>Bastion — Login</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a0a; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login { background: #141414; border: 1px solid #222; border-radius: 12px; padding: 2.5rem; width: 340px; }
+h1 { font-size: 1.3rem; margin-bottom: 0.3rem; color: #fff; }
+.sub { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
+input { width: 100%%; padding: 0.75rem; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 1rem; margin-bottom: 1rem; outline: none; }
+input:focus { border-color: #22c55e; }
+button { width: 100%%; padding: 0.75rem; background: #22c55e; border: none; border-radius: 6px; color: #000; font-size: 1rem; font-weight: 600; cursor: pointer; }
+button:hover { background: #16a34a; }
+.error { color: #ef4444; font-size: 0.85rem; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<div class="login">
+<h1>Bastion</h1>
+<p class="sub">Personal Edge Platform</p>
+%s
+<form method="POST" action="/login">
+<input type="password" name="password" placeholder="Password" autofocus>
+<button type="submit">Login</button>
+</form>
+</div>
+</body>
+</html>`
+
+func loginHTML(errMsg string) string {
+	errDiv := ""
+	if errMsg != "" {
+		errDiv = `<p class="error">` + errMsg + `</p>`
+	}
+	return fmt.Sprintf(loginHTMLTemplate, errDiv)
+}
+
+// ──────────────────────────────────────────────
 // Dashboard API
 // ──────────────────────────────────────────────
 
@@ -413,7 +501,8 @@ func startBastion() {
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.Dashboard.Port)
 		log.Printf("Dashboard: http://localhost%s", addr)
-		if err := http.ListenAndServe(addr, dashboardHandler(metrics, cfg)); err != nil {
+		handler := authMiddleware(cfg.Dashboard.Password, dashboardHandler(metrics, cfg))
+		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatal(err)
 		}
 	}()

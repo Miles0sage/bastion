@@ -3,23 +3,37 @@
   "email": "amit.shah.5201@gmail.com",
   "services": [
     {
-      "name": "segundo-pa",
-      "subdomain": "pa",
-      "target": "http://localhost:8090"
-    },
-    {
       "name": "gateway",
       "subdomain": "gateway",
+      "target": "http://localhost:8000"
+    },
+    {
+      "name": "agent",
+      "subdomain": "agent",
+      "target": "http://localhost:8890"
+    },
+    {
+      "name": "prestresscalc",
+      "subdomain": "prestresscalc",
       "target": "http://localhost:8100"
     },
     {
-      "name": "ai-factory",
-      "subdomain": "factory",
-      "target": "http://localhost:8899"
+      "name": "edgeboard",
+      "subdomain": "edgeboard",
+      "target": "http://localhost:3000"
+    },
+    {
+      "name": "telegram",
+      "subdomain": "telegram",
+      "target": "http://localhost:8080"
     }
   ],
   "dashboard": {
     "port": 9090,
-    "password": "changeme"
+    "password": "B4st10nEdge2026!"
+  },
+  "tls": {
+    "enabled": true,
+    "cert_dir": "/root/bastion/.bastion-certs"
   }
 }
