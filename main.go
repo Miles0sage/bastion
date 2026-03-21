@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
 // Bastion — Personal Edge Platform
@@ -44,10 +48,11 @@ func main() {
 
 // Config represents the bastion configuration
 type Config struct {
-	Domain   string          `json:"domain"`
-	Email    string          `json:"email"`
-	Services []ServiceConfig `json:"services"`
+	Domain    string          `json:"domain"`
+	Email     string          `json:"email"`
+	Services  []ServiceConfig `json:"services"`
 	Dashboard DashboardConfig `json:"dashboard"`
+	TLS       TLSConfig       `json:"tls"`
 }
 
 type ServiceConfig struct {
@@ -60,6 +65,11 @@ type ServiceConfig struct {
 type DashboardConfig struct {
 	Port     int    `json:"port"`
 	Password string `json:"password"`
+}
+
+type TLSConfig struct {
+	Enabled  bool   `json:"enabled"`
+	CertDir  string `json:"cert_dir"`
 }
 
 func defaultConfig() Config {
@@ -76,6 +86,10 @@ func defaultConfig() Config {
 		Dashboard: DashboardConfig{
 			Port:     9090,
 			Password: "changeme",
+		},
+		TLS: TLSConfig{
+			Enabled: true,
+			CertDir: ".bastion-certs",
 		},
 	}
 }
@@ -411,9 +425,65 @@ func startBastion() {
 	for _, svc := range cfg.Services {
 		log.Printf("  %s.%s → %s", svc.Subdomain, cfg.Domain, svc.Target)
 	}
-	log.Printf("Proxy listening on :80")
 
-	if err := http.ListenAndServe(":80", proxy); err != nil {
+	if cfg.TLS.Enabled {
+		startWithTLS(cfg, proxy)
+	} else {
+		log.Printf("Proxy listening on :80 (no TLS)")
+		if err := http.ListenAndServe(":80", proxy); err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+func startWithTLS(cfg Config, handler http.Handler) {
+	// Build list of allowed hostnames
+	var hosts []string
+	for _, svc := range cfg.Services {
+		hosts = append(hosts, svc.Subdomain+"."+cfg.Domain)
+	}
+	hosts = append(hosts, cfg.Domain)
+
+	certDir := cfg.TLS.CertDir
+	if certDir == "" {
+		certDir = ".bastion-certs"
+	}
+
+	manager := &autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		Email:      cfg.Email,
+		Cache:      autocert.DirCache(certDir),
+		HostPolicy: autocert.HostWhitelist(hosts...),
+	}
+
+	// HTTP server for ACME challenges + redirect to HTTPS
+	go func() {
+		httpHandler := manager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			target := "https://" + r.Host + r.URL.RequestURI()
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		}))
+		log.Printf("HTTP→HTTPS redirect on :80")
+		if err := http.ListenAndServe(":80", httpHandler); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// HTTPS server with auto-provisioned certs
+	tlsConfig := &tls.Config{
+		GetCertificate: manager.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
+	}
+
+	server := &http.Server{
+		Addr:      ":443",
+		Handler:   handler,
+		TLSConfig: tlsConfig,
+	}
+
+	log.Printf("Proxy listening on :443 (auto-TLS)")
+	log.Printf("Hosts: %s", strings.Join(hosts, ", "))
+	if err := server.ListenAndServeTLS("", ""); err != nil {
 		log.Fatal(err)
 	}
 }
+
