@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+	_ "modernc.org/sqlite"
 )
 
 // Bastion — Personal Edge Platform
@@ -22,7 +24,7 @@ import (
 // Phase 3: AI WAF (IsolationForest)
 // Phase 4: Auth (OIDC/MFA)
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -118,27 +120,365 @@ func loadConfig() (Config, error) {
 }
 
 // ──────────────────────────────────────────────
+// SQLite Request Logger
+// ──────────────────────────────────────────────
+
+type RequestDB struct {
+	db *sql.DB
+	mu sync.Mutex
+}
+
+func NewRequestDB(path string) (*RequestDB, error) {
+	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite: %w", err)
+	}
+
+	// Create tables
+	schema := `
+	CREATE TABLE IF NOT EXISTS requests (
+		id INTEGER PRIMARY KEY,
+		timestamp TEXT NOT NULL,
+		service TEXT NOT NULL,
+		method TEXT NOT NULL,
+		path TEXT NOT NULL,
+		ip TEXT NOT NULL,
+		status_code INTEGER NOT NULL,
+		duration_ms REAL NOT NULL,
+		user_agent TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_requests_ip ON requests(ip);
+	CREATE INDEX IF NOT EXISTS idx_requests_service ON requests(service);
+
+	CREATE TABLE IF NOT EXISTS blocked_ips (
+		ip TEXT PRIMARY KEY,
+		reason TEXT NOT NULL DEFAULT '',
+		blocked_at TEXT NOT NULL
+	);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		return nil, fmt.Errorf("failed to create schema: %w", err)
+	}
+
+	return &RequestDB{db: db}, nil
+}
+
+func (rdb *RequestDB) LogRequest(service, method, path, ip string, statusCode int, durationMs float64, userAgent string) {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
+
+	_, err := rdb.db.Exec(
+		`INSERT INTO requests (timestamp, service, method, path, ip, status_code, duration_ms, user_agent)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339),
+		service, method, path, ip, statusCode, durationMs, userAgent,
+	)
+	if err != nil {
+		log.Printf("Failed to log request: %v", err)
+	}
+}
+
+func (rdb *RequestDB) RecentRequests(limit int) []map[string]interface{} {
+	rows, err := rdb.db.Query(
+		`SELECT timestamp, service, method, path, ip, status_code, duration_ms, user_agent
+		 FROM requests ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		log.Printf("RecentRequests query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var ts, svc, method, path, ip, ua string
+		var code int
+		var dur float64
+		if err := rows.Scan(&ts, &svc, &method, &path, &ip, &code, &dur, &ua); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"timestamp":   ts,
+			"service":     svc,
+			"method":      method,
+			"path":        path,
+			"ip":          ip,
+			"status_code": code,
+			"duration_ms": dur,
+			"user_agent":  ua,
+		})
+	}
+	return results
+}
+
+func (rdb *RequestDB) TopIPs(limit int) []map[string]interface{} {
+	rows, err := rdb.db.Query(
+		`SELECT ip, COUNT(*) as cnt FROM requests GROUP BY ip ORDER BY cnt DESC LIMIT ?`, limit)
+	if err != nil {
+		log.Printf("TopIPs query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var ip string
+		var cnt int
+		if err := rows.Scan(&ip, &cnt); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"ip":    ip,
+			"count": cnt,
+		})
+	}
+	return results
+}
+
+func (rdb *RequestDB) RequestsPerMinute(minutes int) []map[string]interface{} {
+	since := time.Now().UTC().Add(-time.Duration(minutes) * time.Minute).Format(time.RFC3339)
+	rows, err := rdb.db.Query(
+		`SELECT strftime('%Y-%m-%dT%H:%M:00Z', timestamp) as minute, COUNT(*) as cnt
+		 FROM requests WHERE timestamp >= ? GROUP BY minute ORDER BY minute`, since)
+	if err != nil {
+		log.Printf("RequestsPerMinute query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var minute string
+		var cnt int
+		if err := rows.Scan(&minute, &cnt); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"minute": minute,
+			"count":  cnt,
+		})
+	}
+	return results
+}
+
+func (rdb *RequestDB) ServiceCounts() map[string]int {
+	rows, err := rdb.db.Query(`SELECT service, COUNT(*) as cnt FROM requests GROUP BY service ORDER BY cnt DESC`)
+	if err != nil {
+		log.Printf("ServiceCounts query error: %v", err)
+		return nil
+	}
+	defer rows.Close()
+
+	results := make(map[string]int)
+	for rows.Next() {
+		var svc string
+		var cnt int
+		if err := rows.Scan(&svc, &cnt); err != nil {
+			continue
+		}
+		results[svc] = cnt
+	}
+	return results
+}
+
+// ──────────────────────────────────────────────
+// IP Blocklist (SQLite-backed)
+// ──────────────────────────────────────────────
+
+func (rdb *RequestDB) BlockIP(ip, reason string) error {
+	_, err := rdb.db.Exec(
+		`INSERT OR REPLACE INTO blocked_ips (ip, reason, blocked_at) VALUES (?, ?, ?)`,
+		ip, reason, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (rdb *RequestDB) UnblockIP(ip string) error {
+	_, err := rdb.db.Exec(`DELETE FROM blocked_ips WHERE ip = ?`, ip)
+	return err
+}
+
+func (rdb *RequestDB) IsBlocked(ip string) bool {
+	var count int
+	err := rdb.db.QueryRow(`SELECT COUNT(*) FROM blocked_ips WHERE ip = ?`, ip).Scan(&count)
+	if err != nil {
+		return false
+	}
+	return count > 0
+}
+
+func (rdb *RequestDB) BlockedIPs() []map[string]interface{} {
+	rows, err := rdb.db.Query(`SELECT ip, reason, blocked_at FROM blocked_ips ORDER BY blocked_at DESC`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var ip, reason, blockedAt string
+		if err := rows.Scan(&ip, &reason, &blockedAt); err != nil {
+			continue
+		}
+		results = append(results, map[string]interface{}{
+			"ip":         ip,
+			"reason":     reason,
+			"blocked_at": blockedAt,
+		})
+	}
+	return results
+}
+
+// ──────────────────────────────────────────────
+// Rate Limiter — Per-IP, 100 req/min
+// ──────────────────────────────────────────────
+
+type RateLimiter struct {
+	mu       sync.Mutex
+	requests map[string][]time.Time
+	limit    int
+	window   time.Duration
+}
+
+func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	rl := &RateLimiter{
+		requests: make(map[string][]time.Time),
+		limit:    limit,
+		window:   window,
+	}
+	// Cleanup stale entries every 5 minutes
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			rl.cleanup()
+		}
+	}()
+	return rl
+}
+
+func (rl *RateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	// Filter out old timestamps
+	timestamps := rl.requests[ip]
+	filtered := timestamps[:0]
+	for _, t := range timestamps {
+		if t.After(cutoff) {
+			filtered = append(filtered, t)
+		}
+	}
+
+	if len(filtered) >= rl.limit {
+		rl.requests[ip] = filtered
+		return false
+	}
+
+	rl.requests[ip] = append(filtered, now)
+	return true
+}
+
+func (rl *RateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	cutoff := time.Now().Add(-rl.window)
+	for ip, timestamps := range rl.requests {
+		filtered := timestamps[:0]
+		for _, t := range timestamps {
+			if t.After(cutoff) {
+				filtered = append(filtered, t)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(rl.requests, ip)
+		} else {
+			rl.requests[ip] = filtered
+		}
+	}
+}
+
+func (rl *RateLimiter) RateLimitedCount() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	count := 0
+	cutoff := time.Now().Add(-rl.window)
+	for _, timestamps := range rl.requests {
+		active := 0
+		for _, t := range timestamps {
+			if t.After(cutoff) {
+				active++
+			}
+		}
+		if active >= rl.limit {
+			count++
+		}
+	}
+	return count
+}
+
+func extractIP(r *http.Request) string {
+	// Check X-Forwarded-For first (behind proxy)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.SplitN(xff, ",", 2)
+		return strings.TrimSpace(parts[0])
+	}
+	// Strip port from RemoteAddr
+	ip := r.RemoteAddr
+	if idx := strings.LastIndex(ip, ":"); idx != -1 {
+		ip = ip[:idx]
+	}
+	return ip
+}
+
+// ──────────────────────────────────────────────
 // Reverse Proxy
 // ──────────────────────────────────────────────
 
 type ReverseProxy struct {
-	services []ServiceConfig
-	metrics  *MetricsCollector
+	services    []ServiceConfig
+	metrics     *MetricsCollector
+	rateLimiter *RateLimiter
+	reqDB       *RequestDB
 }
 
-func NewReverseProxy(services []ServiceConfig, metrics *MetricsCollector) *ReverseProxy {
-	return &ReverseProxy{services: services, metrics: metrics}
+func NewReverseProxy(services []ServiceConfig, metrics *MetricsCollector, rl *RateLimiter, reqDB *RequestDB) *ReverseProxy {
+	return &ReverseProxy{
+		services:    services,
+		metrics:     metrics,
+		rateLimiter: rl,
+		reqDB:       reqDB,
+	}
 }
 
 func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	ip := extractIP(r)
+
+	// Check IP blocklist
+	if rp.reqDB.IsBlocked(ip) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Rate limit check
+	if !rp.rateLimiter.Allow(ip) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	host := r.Host
 
 	for _, svc := range rp.services {
 		expected := svc.Subdomain + "." + loadedConfig.Domain
 		if host == expected {
-			rp.metrics.Record(svc.Name, r, time.Since(start))
-			proxyTo(w, r, svc.Target)
+			statusCode := proxyTo(w, r, svc.Target)
+			duration := time.Since(start)
+			rp.metrics.Record(svc.Name, r, duration)
+			rp.reqDB.LogRequest(svc.Name, r.Method, r.URL.Path, ip, statusCode, float64(duration.Milliseconds()), r.UserAgent())
 			return
 		}
 	}
@@ -147,7 +487,7 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
-func proxyTo(w http.ResponseWriter, r *http.Request, target string) {
+func proxyTo(w http.ResponseWriter, r *http.Request, target string) int {
 	// Simple reverse proxy using stdlib
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -159,7 +499,7 @@ func proxyTo(w http.ResponseWriter, r *http.Request, target string) {
 	proxyReq, err := http.NewRequest(r.Method, proxyURL, r.Body)
 	if err != nil {
 		http.Error(w, "proxy error", http.StatusBadGateway)
-		return
+		return http.StatusBadGateway
 	}
 
 	// Copy headers
@@ -174,7 +514,7 @@ func proxyTo(w http.ResponseWriter, r *http.Request, target string) {
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
+		return http.StatusBadGateway
 	}
 	defer resp.Body.Close()
 
@@ -196,6 +536,7 @@ func proxyTo(w http.ResponseWriter, r *http.Request, target string) {
 			break
 		}
 	}
+	return resp.StatusCode
 }
 
 // ──────────────────────────────────────────────
@@ -252,10 +593,10 @@ func (mc *MetricsCollector) GetStats() map[string]interface{} {
 	defer mc.mu.Unlock()
 
 	stats := map[string]interface{}{
-		"total_requests":  len(mc.requests),
-		"services":        mc.totals,
-		"uptime":          time.Since(startTime).String(),
-		"version":         version,
+		"total_requests": len(mc.requests),
+		"services":       mc.totals,
+		"uptime":         time.Since(startTime).String(),
+		"version":        version,
 	}
 	return stats
 }
@@ -266,6 +607,12 @@ func (mc *MetricsCollector) GetStats() map[string]interface{} {
 
 func authMiddleware(password string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// API stats endpoint is public (for monitoring)
+		if r.URL.Path == "/api/stats" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Check session cookie first
 		cookie, err := r.Cookie("bastion_session")
 		if err == nil && cookie.Value == hashPassword(password) {
@@ -349,16 +696,20 @@ func loginHTML(errMsg string) string {
 }
 
 // ──────────────────────────────────────────────
-// Dashboard API
+// Dashboard API + UI
 // ──────────────────────────────────────────────
 
-func dashboardHandler(metrics *MetricsCollector, cfg Config) http.Handler {
+func dashboardHandler(metrics *MetricsCollector, cfg Config, reqDB *RequestDB, rl *RateLimiter) http.Handler {
 	mux := http.NewServeMux()
 
 	// API endpoints
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(metrics.GetStats())
+		stats := metrics.GetStats()
+		stats["rate_limited_ips"] = rl.RateLimitedCount()
+		stats["blocked_ips"] = len(reqDB.BlockedIPs())
+		stats["service_counts"] = reqDB.ServiceCounts()
+		json.NewEncoder(w).Encode(stats)
 	})
 
 	mux.HandleFunc("/api/services", func(w http.ResponseWriter, r *http.Request) {
@@ -370,6 +721,70 @@ func dashboardHandler(metrics *MetricsCollector, cfg Config) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		health := checkHealth(cfg.Services)
 		json.NewEncoder(w).Encode(health)
+	})
+
+	mux.HandleFunc("/api/requests/recent", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		recent := reqDB.RecentRequests(20)
+		json.NewEncoder(w).Encode(recent)
+	})
+
+	mux.HandleFunc("/api/requests/top-ips", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		topIPs := reqDB.TopIPs(10)
+		json.NewEncoder(w).Encode(topIPs)
+	})
+
+	mux.HandleFunc("/api/requests/per-minute", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		rpm := reqDB.RequestsPerMinute(60)
+		json.NewEncoder(w).Encode(rpm)
+	})
+
+	mux.HandleFunc("/api/blocked-ips", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(reqDB.BlockedIPs())
+	})
+
+	mux.HandleFunc("/api/block-ip", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			IP     string `json:"ip"`
+			Reason string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+			http.Error(w, "invalid request: ip required", http.StatusBadRequest)
+			return
+		}
+		if err := reqDB.BlockIP(req.IP, req.Reason); err != nil {
+			http.Error(w, "failed to block ip", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "blocked", "ip": req.IP})
+	})
+
+	mux.HandleFunc("/api/unblock-ip", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			IP string `json:"ip"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+			http.Error(w, "invalid request: ip required", http.StatusBadRequest)
+			return
+		}
+		if err := reqDB.UnblockIP(req.IP); err != nil {
+			http.Error(w, "failed to unblock ip", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "unblocked", "ip": req.IP})
 	})
 
 	// Dashboard UI
@@ -427,48 +842,173 @@ const dashboardHTML = `<!DOCTYPE html>
 body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 2rem; }
 h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #fff; }
 .subtitle { color: #666; margin-bottom: 2rem; font-size: 0.9rem; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
 .card { background: #141414; border: 1px solid #222; border-radius: 8px; padding: 1.5rem; }
 .card h3 { font-size: 0.8rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
 .card .value { font-size: 2rem; font-weight: 700; color: #fff; }
 .card .value.green { color: #22c55e; }
+.card .value.red { color: #ef4444; }
+.card .value.yellow { color: #eab308; }
 .service { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid #1a1a1a; }
 .service:last-child { border: none; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 8px; }
 .dot.up { background: #22c55e; }
 .dot.down { background: #ef4444; }
 .latency { color: #666; font-size: 0.85rem; }
+.section { margin-bottom: 2rem; }
+.section h2 { font-size: 1.1rem; margin-bottom: 1rem; color: #ccc; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th { text-align: left; padding: 0.5rem; color: #888; border-bottom: 1px solid #222; font-weight: 500; }
+td { padding: 0.5rem; border-bottom: 1px solid #1a1a1a; }
+.method { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; font-weight: 600; }
+.method.GET { background: #22c55e22; color: #22c55e; }
+.method.POST { background: #3b82f622; color: #3b82f6; }
+.method.PUT { background: #eab30822; color: #eab308; }
+.method.DELETE { background: #ef444422; color: #ef4444; }
+.chart-bar { height: 20px; background: #22c55e; border-radius: 3px; min-width: 2px; transition: width 0.3s; }
+.chart-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 4px; }
+.chart-label { font-size: 0.75rem; color: #888; min-width: 50px; text-align: right; }
+.chart-value { font-size: 0.75rem; color: #666; min-width: 30px; }
+.ip-actions { display: flex; gap: 0.5rem; align-items: center; }
+.btn-block { background: #ef4444; color: #fff; border: none; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; }
+.btn-block:hover { background: #dc2626; }
+.btn-unblock { background: #22c55e; color: #000; border: none; padding: 3px 8px; border-radius: 4px; font-size: 0.75rem; cursor: pointer; }
+.btn-unblock:hover { background: #16a34a; }
+.svc-count { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #1a1a1a; }
+.svc-count:last-child { border: none; }
 footer { margin-top: 2rem; color: #333; font-size: 0.8rem; text-align: center; }
 </style>
 </head>
 <body>
 <h1>Bastion</h1>
 <p class="subtitle">Personal Edge Platform</p>
+
 <div class="grid">
-  <div class="card"><h3>Total Requests</h3><div class="value" id="total">—</div></div>
-  <div class="card"><h3>Uptime</h3><div class="value green" id="uptime">—</div></div>
-  <div class="card"><h3>Version</h3><div class="value" id="version">—</div></div>
+  <div class="card"><h3>Total Requests</h3><div class="value" id="total">--</div></div>
+  <div class="card"><h3>Uptime</h3><div class="value green" id="uptime">--</div></div>
+  <div class="card"><h3>Rate Limited IPs</h3><div class="value yellow" id="rate-limited">--</div></div>
+  <div class="card"><h3>Blocked IPs</h3><div class="value red" id="blocked">--</div></div>
+  <div class="card"><h3>Version</h3><div class="value" id="version">--</div></div>
 </div>
-<div class="card">
-  <h3>Services</h3>
-  <div id="services">Loading...</div>
+
+<div class="grid">
+  <div class="card section">
+    <h3>Services</h3>
+    <div id="services">Loading...</div>
+  </div>
+  <div class="card section">
+    <h3>Requests per Service</h3>
+    <div id="svc-counts">Loading...</div>
+  </div>
 </div>
-<footer>bastion v0.1.0 — zero config, zero bills</footer>
+
+<div class="card section">
+  <h3>Requests per Minute (last 60 min)</h3>
+  <div id="rpm-chart" style="padding: 0.5rem 0;"></div>
+</div>
+
+<div class="grid">
+  <div class="card section">
+    <h3>Top 10 IPs</h3>
+    <table>
+      <thead><tr><th>IP</th><th>Count</th><th>Action</th></tr></thead>
+      <tbody id="top-ips"></tbody>
+    </table>
+  </div>
+  <div class="card section">
+    <h3>Blocked IPs</h3>
+    <table>
+      <thead><tr><th>IP</th><th>Reason</th><th>Action</th></tr></thead>
+      <tbody id="blocked-ips"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card section">
+  <h3>Last 20 Requests</h3>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead><tr><th>Time</th><th>Service</th><th>Method</th><th>Path</th><th>IP</th><th>Status</th><th>Duration</th></tr></thead>
+    <tbody id="recent-requests"></tbody>
+  </table>
+  </div>
+</div>
+
+<footer>bastion v0.2.0 — zero config, zero bills</footer>
+
 <script>
+async function blockIP(ip) {
+  if (!confirm('Block ' + ip + '?')) return;
+  const reason = prompt('Reason (optional):', 'manual block');
+  await fetch('/api/block-ip', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ip: ip, reason: reason || 'manual block'}) });
+  refresh();
+}
+async function unblockIP(ip) {
+  await fetch('/api/unblock-ip', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ip: ip}) });
+  refresh();
+}
 async function refresh() {
   try {
-    const stats = await (await fetch('/api/stats')).json();
+    const [stats, health, recent, topIPs, rpm, blocked] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/health').then(r => r.json()),
+      fetch('/api/requests/recent').then(r => r.json()),
+      fetch('/api/requests/top-ips').then(r => r.json()),
+      fetch('/api/requests/per-minute').then(r => r.json()),
+      fetch('/api/blocked-ips').then(r => r.json()),
+    ]);
+
     document.getElementById('total').textContent = stats.total_requests;
     document.getElementById('uptime').textContent = stats.uptime;
     document.getElementById('version').textContent = 'v' + stats.version;
-    const health = await (await fetch('/api/health')).json();
+    document.getElementById('rate-limited').textContent = stats.rate_limited_ips || 0;
+    document.getElementById('blocked').textContent = stats.blocked_ips || 0;
+
+    // Services health
     const el = document.getElementById('services');
-    el.innerHTML = health.map(s =>
-      '<div class="service">' +
-        '<span><span class="dot ' + s.status + '"></span>' + s.name + '</span>' +
-        '<span class="latency">' + s.latency_ms + 'ms</span>' +
-      '</div>'
+    el.innerHTML = (health || []).map(s =>
+      '<div class="service"><span><span class="dot ' + s.status + '"></span>' + s.name + '</span><span class="latency">' + s.latency_ms + 'ms</span></div>'
     ).join('');
+
+    // Service counts
+    const sc = stats.service_counts || {};
+    document.getElementById('svc-counts').innerHTML = Object.entries(sc).map(([k,v]) =>
+      '<div class="svc-count"><span>' + k + '</span><span style="color:#fff;font-weight:600">' + v + '</span></div>'
+    ).join('') || '<span style="color:#666">No data yet</span>';
+
+    // RPM chart
+    const rpmEl = document.getElementById('rpm-chart');
+    if (rpm && rpm.length > 0) {
+      const maxRPM = Math.max(...rpm.map(r => r.count), 1);
+      rpmEl.innerHTML = rpm.slice(-30).map(r => {
+        const pct = (r.count / maxRPM * 100).toFixed(0);
+        const label = r.minute ? r.minute.substring(11, 16) : '';
+        return '<div class="chart-row"><span class="chart-label">' + label + '</span><div class="chart-bar" style="width:' + pct + '%"></div><span class="chart-value">' + r.count + '</span></div>';
+      }).join('');
+    } else {
+      rpmEl.innerHTML = '<span style="color:#666">No data yet</span>';
+    }
+
+    // Top IPs
+    const tipEl = document.getElementById('top-ips');
+    tipEl.innerHTML = (topIPs || []).map(t =>
+      '<tr><td>' + t.ip + '</td><td>' + t.count + '</td><td><button class="btn-block" onclick="blockIP(\'' + t.ip + '\')">Block</button></td></tr>'
+    ).join('') || '<tr><td colspan="3" style="color:#666">No data yet</td></tr>';
+
+    // Blocked IPs
+    const bipEl = document.getElementById('blocked-ips');
+    bipEl.innerHTML = (blocked || []).map(b =>
+      '<tr><td>' + b.ip + '</td><td>' + (b.reason || '') + '</td><td><button class="btn-unblock" onclick="unblockIP(\'' + b.ip + '\')">Unblock</button></td></tr>'
+    ).join('') || '<tr><td colspan="3" style="color:#666">None blocked</td></tr>';
+
+    // Recent requests
+    const rrEl = document.getElementById('recent-requests');
+    rrEl.innerHTML = (recent || []).map(r => {
+      const t = r.timestamp ? r.timestamp.substring(11, 19) : '';
+      const sc = r.status_code >= 400 ? 'style="color:#ef4444"' : '';
+      return '<tr><td>' + t + '</td><td>' + r.service + '</td><td><span class="method ' + r.method + '">' + r.method + '</span></td><td>' + r.path + '</td><td>' + r.ip + '</td><td ' + sc + '>' + r.status_code + '</td><td>' + (r.duration_ms || 0).toFixed(1) + 'ms</td></tr>';
+    }).join('') || '<tr><td colspan="7" style="color:#666">No requests yet</td></tr>';
+
   } catch(e) { console.error(e); }
 }
 refresh();
@@ -494,14 +1034,21 @@ func startBastion() {
 	loadedConfig = cfg
 	startTime = time.Now()
 
+	// Initialize SQLite request logger
+	reqDB, err := NewRequestDB("bastion.db")
+	if err != nil {
+		log.Fatalf("Failed to initialize request database: %v", err)
+	}
+
 	metrics := NewMetricsCollector()
-	proxy := NewReverseProxy(cfg.Services, metrics)
+	rateLimiter := NewRateLimiter(100, time.Minute)
+	proxy := NewReverseProxy(cfg.Services, metrics, rateLimiter, reqDB)
 
 	// Start dashboard
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.Dashboard.Port)
 		log.Printf("Dashboard: http://localhost%s", addr)
-		handler := authMiddleware(cfg.Dashboard.Password, dashboardHandler(metrics, cfg))
+		handler := authMiddleware(cfg.Dashboard.Password, dashboardHandler(metrics, cfg, reqDB, rateLimiter))
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatal(err)
 		}
@@ -511,8 +1058,10 @@ func startBastion() {
 	log.Printf("Bastion v%s starting", version)
 	log.Printf("Domain: %s", cfg.Domain)
 	log.Printf("Services: %d", len(cfg.Services))
+	log.Printf("Rate limit: 100 req/min per IP")
+	log.Printf("SQLite logging: bastion.db")
 	for _, svc := range cfg.Services {
-		log.Printf("  %s.%s → %s", svc.Subdomain, cfg.Domain, svc.Target)
+		log.Printf("  %s.%s -> %s", svc.Subdomain, cfg.Domain, svc.Target)
 	}
 
 	if cfg.TLS.Enabled {
@@ -551,7 +1100,7 @@ func startWithTLS(cfg Config, handler http.Handler) {
 			target := "https://" + r.Host + r.URL.RequestURI()
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		}))
-		log.Printf("HTTP→HTTPS redirect on :80")
+		log.Printf("HTTP->HTTPS redirect on :80")
 		if err := http.ListenAndServe(":80", httpHandler); err != nil {
 			log.Fatal(err)
 		}
@@ -575,4 +1124,3 @@ func startWithTLS(cfg Config, handler http.Handler) {
 		log.Fatal(err)
 	}
 }
-
