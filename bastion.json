@@ -1,0 +1,25 @@
+{
+  "domain": "overseerclaw.uk",
+  "email": "amit.shah.5201@gmail.com",
+  "services": [
+    {
+      "name": "segundo-pa",
+      "subdomain": "pa",
+      "target": "http://localhost:8090"
+    },
+    {
+      "name": "gateway",
+      "subdomain": "gateway",
+      "target": "http://localhost:8100"
+    },
+    {
+      "name": "ai-factory",
+      "subdomain": "factory",
+      "target": "http://localhost:8899"
+    }
+  ],
+  "dashboard": {
+    "port": 9090,
+    "password": "changeme"
+  }
+}
