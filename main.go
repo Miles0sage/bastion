@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Miles0sage/bastion/waf"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
 
@@ -126,6 +131,11 @@ func loadConfig() (Config, error) {
 type RequestDB struct {
 	db *sql.DB
 	mu sync.Mutex
+}
+
+// DB returns the underlying *sql.DB for shared use (e.g., WAF).
+func (rdb *RequestDB) DB() *sql.DB {
+	return rdb.db
 }
 
 func NewRequestDB(path string) (*RequestDB, error) {
@@ -602,10 +612,93 @@ func (mc *MetricsCollector) GetStats() map[string]interface{} {
 }
 
 // ──────────────────────────────────────────────
-// Auth Middleware
+// Session Store — random tokens, 24h expiry
 // ──────────────────────────────────────────────
 
-func authMiddleware(password string, next http.Handler) http.Handler {
+type Session struct {
+	Token     string
+	ExpiresAt time.Time
+	CSRFToken string
+}
+
+type SessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]*Session
+}
+
+func NewSessionStore() *SessionStore {
+	ss := &SessionStore{sessions: make(map[string]*Session)}
+	// Auto-cleanup expired sessions every 15 minutes
+	go func() {
+		for {
+			time.Sleep(15 * time.Minute)
+			ss.Cleanup()
+		}
+	}()
+	return ss
+}
+
+func (ss *SessionStore) Create() *Session {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	token := generateToken(32)
+	csrf := generateToken(32)
+	s := &Session{
+		Token:     token,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+		CSRFToken: csrf,
+	}
+	ss.sessions[token] = s
+	return s
+}
+
+func (ss *SessionStore) Get(token string) (*Session, bool) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	s, ok := ss.sessions[token]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(s.ExpiresAt) {
+		delete(ss.sessions, token)
+		return nil, false
+	}
+	return s, true
+}
+
+func (ss *SessionStore) Delete(token string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	delete(ss.sessions, token)
+}
+
+func (ss *SessionStore) Cleanup() {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	now := time.Now()
+	for token, s := range ss.sessions {
+		if now.After(s.ExpiresAt) {
+			delete(ss.sessions, token)
+		}
+	}
+}
+
+func generateToken(bytes int) string {
+	b := make([]byte, bytes)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("Failed to generate random token: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// ──────────────────────────────────────────────
+// Auth Middleware — bcrypt, session tokens, CSRF
+// ──────────────────────────────────────────────
+
+func authMiddleware(passwordHash []byte, sessions *SessionStore, tlsEnabled bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// API stats endpoint is public (for monitoring)
 		if r.URL.Path == "/api/stats" {
@@ -613,46 +706,116 @@ func authMiddleware(password string, next http.Handler) http.Handler {
 			return
 		}
 
-		// Check session cookie first
-		cookie, err := r.Cookie("bastion_session")
-		if err == nil && cookie.Value == hashPassword(password) {
-			next.ServeHTTP(w, r)
+		// Logout endpoint
+		if r.URL.Path == "/logout" && r.Method == http.MethodPost {
+			if cookie, err := r.Cookie("bastion_session"); err == nil {
+				sessions.Delete(cookie.Value)
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     "bastion_session",
+				Value:    "",
+				Path:     "/",
+				MaxAge:   -1,
+				HttpOnly: true,
+				Secure:   tlsEnabled,
+				SameSite: http.SameSiteStrictMode,
+			})
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
 
-		// Login page
-		if r.URL.Path == "/login" && r.Method == "POST" {
-			r.ParseForm()
-			if r.FormValue("password") == password {
-				http.SetCookie(w, &http.Cookie{
-					Name:     "bastion_session",
-					Value:    hashPassword(password),
-					Path:     "/",
-					MaxAge:   86400 * 7, // 7 days
-					HttpOnly: true,
-					SameSite: http.SameSiteStrictMode,
-				})
-				http.Redirect(w, r, "/", http.StatusSeeOther)
+		// Check session cookie
+		cookie, err := r.Cookie("bastion_session")
+		if err == nil {
+			if _, ok := sessions.Get(cookie.Value); ok {
+				next.ServeHTTP(w, r)
 				return
 			}
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(loginHTML("Wrong password")))
+		}
+
+		// Login form submission
+		if r.URL.Path == "/login" && r.Method == http.MethodPost {
+			r.ParseForm()
+			submittedCSRF := r.FormValue("csrf_token")
+			csrfCookie, csrfErr := r.Cookie("bastion_csrf")
+
+			// Validate CSRF token
+			if csrfErr != nil || csrfCookie.Value == "" || csrfCookie.Value != submittedCSRF {
+				w.WriteHeader(http.StatusForbidden)
+				csrf := generateToken(32)
+				w.Write([]byte(loginHTML("Invalid request. Please try again.", csrf)))
+				http.SetCookie(w, &http.Cookie{
+					Name:     "bastion_csrf",
+					Value:    csrf,
+					Path:     "/login",
+					MaxAge:   600,
+					HttpOnly: true,
+					Secure:   tlsEnabled,
+					SameSite: http.SameSiteStrictMode,
+				})
+				return
+			}
+
+			// Clear the used CSRF cookie
+			http.SetCookie(w, &http.Cookie{
+				Name:   "bastion_csrf",
+				Value:  "",
+				Path:   "/login",
+				MaxAge: -1,
+			})
+
+			// Compare password with bcrypt hash
+			pw := r.FormValue("password")
+			if err := bcrypt.CompareHashAndPassword(passwordHash, []byte(pw)); err != nil {
+				csrf := generateToken(32)
+				http.SetCookie(w, &http.Cookie{
+					Name:     "bastion_csrf",
+					Value:    csrf,
+					Path:     "/login",
+					MaxAge:   600,
+					HttpOnly: true,
+					Secure:   tlsEnabled,
+					SameSite: http.SameSiteStrictMode,
+				})
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(loginHTML("Wrong password", csrf)))
+				return
+			}
+
+			// Create session
+			session := sessions.Create()
+			http.SetCookie(w, &http.Cookie{
+				Name:     "bastion_session",
+				Value:    session.Token,
+				Path:     "/",
+				MaxAge:   86400, // 24 hours
+				HttpOnly: true,
+				Secure:   tlsEnabled,
+				SameSite: http.SameSiteStrictMode,
+			})
+			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
 
+		// Show login page (GET /login or any unauthenticated request)
 		if r.URL.Path == "/login" {
-			w.Write([]byte(loginHTML("")))
+			csrf := generateToken(32)
+			http.SetCookie(w, &http.Cookie{
+				Name:     "bastion_csrf",
+				Value:    csrf,
+				Path:     "/login",
+				MaxAge:   600, // 10 minutes
+				HttpOnly: true,
+				Secure:   tlsEnabled,
+				SameSite: http.SameSiteStrictMode,
+			})
+			w.Write([]byte(loginHTML("", csrf)))
 			return
 		}
 
 		// Not authenticated — redirect to login
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 	})
-}
-
-func hashPassword(pw string) string {
-	h := fmt.Sprintf("%x", pw+"bastion-salt-2026")
-	return h
 }
 
 const loginHTMLTemplate = `<!DOCTYPE html>
@@ -667,8 +830,8 @@ body { font-family: -apple-system, system-ui, sans-serif; background: #0a0a0a; c
 .login { background: #141414; border: 1px solid #222; border-radius: 12px; padding: 2.5rem; width: 340px; }
 h1 { font-size: 1.3rem; margin-bottom: 0.3rem; color: #fff; }
 .sub { color: #666; font-size: 0.85rem; margin-bottom: 1.5rem; }
-input { width: 100%%; padding: 0.75rem; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 1rem; margin-bottom: 1rem; outline: none; }
-input:focus { border-color: #22c55e; }
+input[type="password"] { width: 100%%; padding: 0.75rem; background: #0a0a0a; border: 1px solid #333; border-radius: 6px; color: #fff; font-size: 1rem; margin-bottom: 1rem; outline: none; }
+input[type="password"]:focus { border-color: #22c55e; }
 button { width: 100%%; padding: 0.75rem; background: #22c55e; border: none; border-radius: 6px; color: #000; font-size: 1rem; font-weight: 600; cursor: pointer; }
 button:hover { background: #16a34a; }
 .error { color: #ef4444; font-size: 0.85rem; margin-bottom: 1rem; }
@@ -680,6 +843,7 @@ button:hover { background: #16a34a; }
 <p class="sub">Personal Edge Platform</p>
 %s
 <form method="POST" action="/login">
+<input type="hidden" name="csrf_token" value="%s">
 <input type="password" name="password" placeholder="Password" autofocus>
 <button type="submit">Login</button>
 </form>
@@ -687,20 +851,23 @@ button:hover { background: #16a34a; }
 </body>
 </html>`
 
-func loginHTML(errMsg string) string {
+func loginHTML(errMsg string, csrfToken string) string {
 	errDiv := ""
 	if errMsg != "" {
-		errDiv = `<p class="error">` + errMsg + `</p>`
+		errDiv = `<p class="error">` + html.EscapeString(errMsg) + `</p>`
 	}
-	return fmt.Sprintf(loginHTMLTemplate, errDiv)
+	return fmt.Sprintf(loginHTMLTemplate, errDiv, html.EscapeString(csrfToken))
 }
 
 // ──────────────────────────────────────────────
 // Dashboard API + UI
 // ──────────────────────────────────────────────
 
-func dashboardHandler(metrics *MetricsCollector, cfg Config, reqDB *RequestDB, rl *RateLimiter) http.Handler {
+func dashboardHandler(metrics *MetricsCollector, cfg Config, reqDB *RequestDB, rl *RateLimiter, wafEngine *waf.Engine) http.Handler {
 	mux := http.NewServeMux()
+
+	// WAF API endpoints
+	waf.RegisterAPI(mux, wafEngine)
 
 	// API endpoints
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -1044,11 +1211,31 @@ func startBastion() {
 	rateLimiter := NewRateLimiter(100, time.Minute)
 	proxy := NewReverseProxy(cfg.Services, metrics, rateLimiter, reqDB)
 
+	// Initialize WAF engine
+	wafCfg := waf.DefaultConfig()
+	wafEngine, err := waf.NewEngine(reqDB.DB(), wafCfg)
+	if err != nil {
+		log.Fatalf("Failed to initialize WAF: %v", err)
+	}
+
+	// Wrap proxy with WAF middleware: Rate Limiter -> IP Blocklist -> WAF -> Reverse Proxy
+	// Rate limiter and IP blocklist are inside ReverseProxy.ServeHTTP already.
+	// WAF sits between the proxy's blocklist check and the actual proxying.
+	var proxyHandler http.Handler = proxy
+	proxyHandler = waf.Middleware(wafEngine, proxyHandler)
+
+	// Hash password with bcrypt on startup
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(cfg.Dashboard.Password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Fatalf("Failed to hash password: %v", err)
+	}
+	sessions := NewSessionStore()
+
 	// Start dashboard
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.Dashboard.Port)
 		log.Printf("Dashboard: http://localhost%s", addr)
-		handler := authMiddleware(cfg.Dashboard.Password, dashboardHandler(metrics, cfg, reqDB, rateLimiter))
+		handler := authMiddleware(passwordHash, sessions, cfg.TLS.Enabled, dashboardHandler(metrics, cfg, reqDB, rateLimiter, wafEngine))
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatal(err)
 		}
@@ -1059,13 +1246,14 @@ func startBastion() {
 	log.Printf("Domain: %s", cfg.Domain)
 	log.Printf("Services: %d", len(cfg.Services))
 	log.Printf("Rate limit: 100 req/min per IP")
+	log.Printf("WAF: enabled (learning mode, %d samples to train)", wafCfg.LearningSize)
 	log.Printf("SQLite logging: bastion.db")
 	for _, svc := range cfg.Services {
 		log.Printf("  %s.%s -> %s", svc.Subdomain, cfg.Domain, svc.Target)
 	}
 
 	if cfg.TLS.Enabled {
-		startWithTLS(cfg, proxy)
+		startWithTLS(cfg, proxyHandler)
 	} else {
 		log.Printf("Proxy listening on :80 (no TLS)")
 		if err := http.ListenAndServe(":80", proxy); err != nil {
