@@ -26,6 +26,11 @@
       "name": "telegram",
       "subdomain": "telegram",
       "target": "http://localhost:8080"
+    },
+    {
+      "name": "segundo",
+      "subdomain": "pa",
+      "target": "http://localhost:3100"
     }
   ],
   "dashboard": {
