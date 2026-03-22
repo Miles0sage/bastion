@@ -23,8 +23,8 @@ That's it. Your services are live with HTTPS.
 - [x] **IP blocklist** — block/unblock from the dashboard
 - [x] **SQLite request logging** — every request persisted, queryable
 - [x] **Session auth** — bcrypt passwords, random session tokens, CSRF protection
-- [x] **Single binary** — compiles to ~15MB, runs anywhere Go runs
-- [ ] **AI WAF** — anomaly detection with IsolationForest (coming)
+- [x] **Single binary** — compiles to ~17MB, runs anywhere Go runs
+- [x] **AI WAF** — IsolationForest anomaly detection, learns your traffic, blocks threats
 - [ ] **OIDC/MFA** — SSO and multi-factor auth (coming)
 
 ## Architecture
@@ -70,9 +70,9 @@ That's it. Your services are live with HTTPS.
 | Rate limiting | Built-in | Paid tier | No | Plugin |
 | IP blocking | Built-in | Paid tier | No | No |
 | Request logging | SQLite | Analytics ($) | No | JSON logs |
-| AI WAF | Coming | Enterprise | No | No |
+| AI WAF | **Built-in** | Enterprise | No | No |
 | Config format | JSON (1 file) | Web UI | YAML | Caddyfile |
-| Binary size | ~15MB | N/A | ~30MB | ~40MB |
+| Binary size | ~17MB | N/A | ~30MB | ~40MB |
 | Monthly cost | **$0** | $0-$200+ | $0 | $0 |
 | Lines of code | ~1,200 | Proprietary | ~50K | ~100K |
 
@@ -143,16 +143,22 @@ Traffic flow: `app.example.com` -> Bastion (TLS) -> WireGuard tunnel -> `localho
 
 The tunnel uses userspace WireGuard — no kernel module required, works on macOS/Linux/Windows.
 
-## AI WAF (Coming)
+## AI WAF
 
-Bastion collects every request into SQLite with method, path, IP, status code, duration, and user agent. This data feeds an IsolationForest-based anomaly detector that will:
+Bastion's WAF uses an IsolationForest anomaly detector — the same ML technique used in production fraud detection:
 
-1. **Learn** normal traffic patterns per service
-2. **Score** incoming requests in real-time
-3. **Block** anomalous IPs automatically
-4. **Surface** threats in the dashboard
+1. **Learning mode**: Collects first 1,000 requests to build a traffic baseline
+2. **Active mode**: Scores every request (0.0 = normal, 1.0 = anomalous), blocks above threshold (0.65)
+3. **Rule engine**: Instant blocking of SQL injection, XSS, path traversal patterns (no training needed)
+4. **Dashboard**: Real-time WAF events, scores, blocked threats
 
-The SQLite-backed request log already powers the rate limiter and IP blocklist. The AI layer adds pattern recognition without external dependencies.
+API endpoints:
+- `GET /api/waf/status` — mode, training progress, stats
+- `GET /api/waf/events` — recent WAF decisions with scores
+- `POST /api/waf/retrain` — force model retraining
+- `GET /api/waf/score?url=...` — test a URL against the model
+
+The forest is trained from scratch in pure Go — no Python, no external ML libraries, no cloud APIs.
 
 ## Dashboard
 

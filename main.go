@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Miles0sage/bastion/alerts"
 	"github.com/Miles0sage/bastion/waf"
 	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/crypto/bcrypt"
@@ -58,8 +59,9 @@ type Config struct {
 	Domain    string          `json:"domain"`
 	Email     string          `json:"email"`
 	Services  []ServiceConfig `json:"services"`
-	Dashboard DashboardConfig `json:"dashboard"`
-	TLS       TLSConfig       `json:"tls"`
+	Dashboard DashboardConfig  `json:"dashboard"`
+	TLS       TLSConfig        `json:"tls"`
+	Alerts    alerts.AlertConfig `json:"alerts"`
 }
 
 type ServiceConfig struct {
@@ -863,11 +865,17 @@ func loginHTML(errMsg string, csrfToken string) string {
 // Dashboard API + UI
 // ──────────────────────────────────────────────
 
-func dashboardHandler(metrics *MetricsCollector, cfg Config, reqDB *RequestDB, rl *RateLimiter, wafEngine *waf.Engine) http.Handler {
+func dashboardHandler(metrics *MetricsCollector, cfg Config, reqDB *RequestDB, rl *RateLimiter, wafEngine *waf.Engine, clawMonitor *alerts.ClawMonitor) http.Handler {
 	mux := http.NewServeMux()
 
 	// WAF API endpoints
 	waf.RegisterAPI(mux, wafEngine)
+
+	// Claw Monitor API endpoints
+	if clawMonitor != nil {
+		mux.HandleFunc("/api/claw/reports", clawMonitor.HandleReports)
+		mux.HandleFunc("/api/claw/status", clawMonitor.HandleStatus)
+	}
 
 	// API endpoints
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
@@ -1091,6 +1099,35 @@ footer { margin-top: 2rem; color: #333; font-size: 0.8rem; text-align: center; }
   </div>
 </div>
 
+<div class="grid">
+  <div class="card">
+    <h3>WAF Status</h3>
+    <div id="waf-mode" class="value green">--</div>
+  </div>
+  <div class="card">
+    <h3>WAF Analyzed</h3>
+    <div id="waf-analyzed" class="value">--</div>
+  </div>
+  <div class="card">
+    <h3>Threats Blocked</h3>
+    <div id="waf-blocked" class="value red">--</div>
+  </div>
+  <div class="card">
+    <h3>Training Progress</h3>
+    <div id="waf-training" class="value yellow">--</div>
+  </div>
+</div>
+
+<div class="card section">
+  <h3>Recent WAF Events</h3>
+  <div style="overflow-x:auto;">
+  <table>
+    <thead><tr><th>Time</th><th>IP</th><th>Method</th><th>Path</th><th>Score</th><th>Blocked</th><th>Reason</th></tr></thead>
+    <tbody id="waf-events"></tbody>
+  </table>
+  </div>
+</div>
+
 <div class="card section">
   <h3>Last 20 Requests</h3>
   <div style="overflow-x: auto;">
@@ -1098,6 +1135,14 @@ footer { margin-top: 2rem; color: #333; font-size: 0.8rem; text-align: center; }
     <thead><tr><th>Time</th><th>Service</th><th>Method</th><th>Path</th><th>IP</th><th>Status</th><th>Duration</th></tr></thead>
     <tbody id="recent-requests"></tbody>
   </table>
+  </div>
+</div>
+
+<div class="card section">
+  <h3>Claw Monitor Reports</h3>
+  <div id="claw-status" style="margin-bottom: 1rem;"></div>
+  <div id="claw-reports" style="max-height: 400px; overflow-y: auto;">
+    <span style="color:#666">Loading...</span>
   </div>
 </div>
 
@@ -1116,13 +1161,15 @@ async function unblockIP(ip) {
 }
 async function refresh() {
   try {
-    const [stats, health, recent, topIPs, rpm, blocked] = await Promise.all([
+    const [stats, health, recent, topIPs, rpm, blocked, wafStatus, wafEvents] = await Promise.all([
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/health').then(r => r.json()),
       fetch('/api/requests/recent').then(r => r.json()),
       fetch('/api/requests/top-ips').then(r => r.json()),
       fetch('/api/requests/per-minute').then(r => r.json()),
       fetch('/api/blocked-ips').then(r => r.json()),
+      fetch('/api/waf/status').then(r => r.json()).catch(() => ({})),
+      fetch('/api/waf/events').then(r => r.json()).catch(() => []),
     ]);
 
     document.getElementById('total').textContent = stats.total_requests;
@@ -1130,6 +1177,27 @@ async function refresh() {
     document.getElementById('version').textContent = 'v' + stats.version;
     document.getElementById('rate-limited').textContent = stats.rate_limited_ips || 0;
     document.getElementById('blocked').textContent = stats.blocked_ips || 0;
+
+    // WAF stats
+    if (wafStatus && wafStatus.mode) {
+      document.getElementById('waf-mode').textContent = wafStatus.mode.toUpperCase();
+      document.getElementById('waf-mode').className = 'value ' + (wafStatus.mode === 'active' ? 'green' : 'yellow');
+      document.getElementById('waf-analyzed').textContent = wafStatus.requests_analyzed || 0;
+      document.getElementById('waf-blocked').textContent = wafStatus.threats_blocked || 0;
+      const tp = wafStatus.mode === 'active' ? '100%%' : Math.round((wafStatus.training_samples / wafStatus.learning_target) * 100) + '%%';
+      document.getElementById('waf-training').textContent = tp;
+    }
+
+    // WAF events
+    const weEl = document.getElementById('waf-events');
+    if (weEl) {
+      weEl.innerHTML = (wafEvents || []).slice(0, 20).map(e => {
+        const t = e.timestamp ? e.timestamp.substring(11, 19) : '';
+        const sc2 = e.score > 0.65 ? 'color:#ef4444' : e.score > 0.4 ? 'color:#eab308' : '';
+        const bl = e.blocked ? '<span style="color:#ef4444;font-weight:600">YES</span>' : '<span style="color:#22c55e">no</span>';
+        return '<tr><td>' + t + '</td><td>' + e.ip + '</td><td><span class="method " + e.method + "">' + e.method + '</span></td><td>' + e.path + '</td><td style="' + sc2 + '">' + (e.score || 0).toFixed(3) + '</td><td>' + bl + '</td><td style="color:#888">' + (e.reason || '-') + '</td></tr>';
+      }).join('') || '<tr><td colspan="7" style="color:#666">No WAF events yet</td></tr>';
+    }
 
     // Services health
     const el = document.getElementById('services');
@@ -1175,6 +1243,24 @@ async function refresh() {
       const sc = r.status_code >= 400 ? 'style="color:#ef4444"' : '';
       return '<tr><td>' + t + '</td><td>' + r.service + '</td><td><span class="method ' + r.method + '">' + r.method + '</span></td><td>' + r.path + '</td><td>' + r.ip + '</td><td ' + sc + '>' + r.status_code + '</td><td>' + (r.duration_ms || 0).toFixed(1) + 'ms</td></tr>';
     }).join('') || '<tr><td colspan="7" style="color:#666">No requests yet</td></tr>';
+
+    // Claw Monitor
+    const csEl = document.getElementById('claw-status');
+    if (clawStatus) {
+      const sevColor = clawStatus.status === 'ok' ? '#22c55e' : clawStatus.status === 'warning' ? '#eab308' : clawStatus.status === 'critical' ? '#ef4444' : '#666';
+      csEl.innerHTML = '<span style="color:' + sevColor + ';font-weight:600;text-transform:uppercase">' + (clawStatus.status || 'unknown') + '</span><span style="color:#666;margin-left:8px;font-size:0.8rem">checked ' + (clawStatus.checked_at ? clawStatus.checked_at.substring(11,19) : '') + '</span>';
+    }
+
+    const crEl = document.getElementById('claw-reports');
+    if (clawReports && clawReports.length > 0) {
+      crEl.innerHTML = clawReports.slice(0, 20).map(r => {
+        const sevColor = r.severity === 'ok' ? '#22c55e' : r.severity === 'warning' ? '#eab308' : '#ef4444';
+        const t = r.timestamp ? r.timestamp.substring(0, 16).replace('T', ' ') : '';
+        return '<div style="padding:0.5rem 0;border-bottom:1px solid #1a1a1a"><span style="color:' + sevColor + ';font-weight:600;font-size:0.75rem;text-transform:uppercase;margin-right:8px">' + r.severity + '</span><span style="color:#666;font-size:0.75rem">' + t + '</span><div style="color:#ccc;font-size:0.85rem;margin-top:4px;white-space:pre-wrap">' + (r.summary || '') + '</div></div>';
+      }).join('');
+    } else {
+      crEl.innerHTML = '<span style="color:#666">No reports yet. Claw monitor runs every 5 minutes.</span>';
+    }
 
   } catch(e) { console.error(e); }
 }
@@ -1224,6 +1310,28 @@ func startBastion() {
 	var proxyHandler http.Handler = proxy
 	proxyHandler = waf.Middleware(wafEngine, proxyHandler)
 
+	// Build service info list for alerts
+	var svcInfos []alerts.ServiceInfo
+	for _, svc := range cfg.Services {
+		svcInfos = append(svcInfos, alerts.ServiceInfo{
+			Name:      svc.Name,
+			Subdomain: svc.Subdomain,
+			Target:    svc.Target,
+			Health:    svc.Health,
+		})
+	}
+
+	// Initialize alert engine
+	alertEngine := alerts.NewAlertEngine(reqDB.DB(), cfg.Alerts, cfg.Domain, svcInfos)
+	alertEngine.Start()
+
+	// Initialize Claw Monitor (autonomous SRE)
+	clawMonitor, err := alerts.NewClawMonitor(reqDB.DB(), cfg.Domain, svcInfos, alertEngine)
+	if err != nil {
+		log.Fatalf("Failed to initialize Claw Monitor: %v", err)
+	}
+	clawMonitor.Start()
+
 	// Hash password with bcrypt on startup
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(cfg.Dashboard.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -1235,7 +1343,7 @@ func startBastion() {
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.Dashboard.Port)
 		log.Printf("Dashboard: http://localhost%s", addr)
-		handler := authMiddleware(passwordHash, sessions, cfg.TLS.Enabled, dashboardHandler(metrics, cfg, reqDB, rateLimiter, wafEngine))
+		handler := authMiddleware(passwordHash, sessions, cfg.TLS.Enabled, dashboardHandler(metrics, cfg, reqDB, rateLimiter, wafEngine, clawMonitor))
 		if err := http.ListenAndServe(addr, handler); err != nil {
 			log.Fatal(err)
 		}
@@ -1247,6 +1355,8 @@ func startBastion() {
 	log.Printf("Services: %d", len(cfg.Services))
 	log.Printf("Rate limit: 100 req/min per IP")
 	log.Printf("WAF: enabled (learning mode, %d samples to train)", wafCfg.LearningSize)
+	log.Printf("Alerts: enabled=%v", cfg.Alerts.Enabled)
+	log.Printf("Claw Monitor: active (5 min interval)")
 	log.Printf("SQLite logging: bastion.db")
 	for _, svc := range cfg.Services {
 		log.Printf("  %s.%s -> %s", svc.Subdomain, cfg.Domain, svc.Target)
@@ -1256,7 +1366,7 @@ func startBastion() {
 		startWithTLS(cfg, proxyHandler)
 	} else {
 		log.Printf("Proxy listening on :80 (no TLS)")
-		if err := http.ListenAndServe(":80", proxy); err != nil {
+		if err := http.ListenAndServe(":80", proxyHandler); err != nil {
 			log.Fatal(err)
 		}
 	}
