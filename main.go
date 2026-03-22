@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
@@ -8,8 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -451,10 +455,17 @@ func extractIP(r *http.Request) string {
 // ──────────────────────────────────────────────
 
 type ReverseProxy struct {
+	mu          sync.RWMutex
 	services    []ServiceConfig
 	metrics     *MetricsCollector
 	rateLimiter *RateLimiter
 	reqDB       *RequestDB
+}
+
+func (rp *ReverseProxy) UpdateServices(services []ServiceConfig) {
+	rp.mu.Lock()
+	rp.services = services
+	rp.mu.Unlock()
 }
 
 func NewReverseProxy(services []ServiceConfig, metrics *MetricsCollector, rl *RateLimiter, reqDB *RequestDB) *ReverseProxy {
@@ -484,8 +495,15 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := r.Host
 
-	for _, svc := range rp.services {
-		expected := svc.Subdomain + "." + loadedConfig.Domain
+	rp.mu.RLock()
+	services := rp.services
+	configMu.RLock()
+	domain := loadedConfig.Domain
+	configMu.RUnlock()
+	rp.mu.RUnlock()
+
+	for _, svc := range services {
+		expected := svc.Subdomain + "." + domain
 		if host == expected {
 			statusCode := proxyTo(w, r, svc.Target)
 			duration := time.Since(start)
@@ -499,7 +517,121 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade request.
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Connection"), "Upgrade") &&
+		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+// proxyWebSocket hijacks the client connection and does a raw TCP bidirectional
+// copy to the upstream, allowing the HTTP 101 upgrade handshake to pass through.
+func proxyWebSocket(w http.ResponseWriter, r *http.Request, target string) int {
+	// Parse the target to get host:port for net.Dial
+	parsed, err := url.Parse(target)
+	if err != nil {
+		http.Error(w, "bad upstream url", http.StatusBadGateway)
+		return http.StatusBadGateway
+	}
+	dialAddr := parsed.Host
+	if !strings.Contains(dialAddr, ":") {
+		if parsed.Scheme == "https" || parsed.Scheme == "wss" {
+			dialAddr += ":443"
+		} else {
+			dialAddr += ":80"
+		}
+	}
+
+	// Connect to upstream
+	upstreamConn, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	if err != nil {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return http.StatusBadGateway
+	}
+	defer upstreamConn.Close()
+
+	// Hijack the client connection
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack not supported", http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, "hijack failed", http.StatusInternalServerError)
+		return http.StatusInternalServerError
+	}
+	defer clientConn.Close()
+
+	// Reconstruct the original upgrade request and send it to the upstream
+	reqPath := r.URL.Path
+	if r.URL.RawQuery != "" {
+		reqPath += "?" + r.URL.RawQuery
+	}
+	var reqBuf strings.Builder
+	fmt.Fprintf(&reqBuf, "%s %s HTTP/1.1\r\n", r.Method, reqPath)
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	r.Header.Set("X-Forwarded-Host", r.Host)
+	for key, values := range r.Header {
+		for _, v := range values {
+			fmt.Fprintf(&reqBuf, "%s: %s\r\n", key, v)
+		}
+	}
+	reqBuf.WriteString("\r\n")
+	if _, err := upstreamConn.Write([]byte(reqBuf.String())); err != nil {
+		return http.StatusBadGateway
+	}
+
+	// Read the upstream response status to confirm the upgrade
+	upstreamBuf := bufio.NewReader(upstreamConn)
+	resp, err := http.ReadResponse(upstreamBuf, r)
+	if err != nil {
+		return http.StatusBadGateway
+	}
+	// Forward the upstream response (101 or error) back to client
+	var respBuf strings.Builder
+	fmt.Fprintf(&respBuf, "HTTP/1.1 %s\r\n", resp.Status)
+	for key, values := range resp.Header {
+		for _, v := range values {
+			fmt.Fprintf(&respBuf, "%s: %s\r\n", key, v)
+		}
+	}
+	respBuf.WriteString("\r\n")
+	if _, err := clientBuf.WriteString(respBuf.String()); err != nil {
+		return resp.StatusCode
+	}
+	if err := clientBuf.Flush(); err != nil {
+		return resp.StatusCode
+	}
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return resp.StatusCode
+	}
+
+	// Bidirectional copy — pipe data in both directions until one side closes
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(upstreamConn, clientConn)
+		done <- struct{}{}
+	}()
+	go func() {
+		// Drain any buffered data from the upstream reader first
+		if upstreamBuf.Buffered() > 0 {
+			io.CopyN(clientConn, upstreamBuf, int64(upstreamBuf.Buffered()))
+		}
+		io.Copy(clientConn, upstreamConn)
+		done <- struct{}{}
+	}()
+	<-done // Wait for one direction to finish, then clean up
+
+	return http.StatusSwitchingProtocols
+}
+
 func proxyTo(w http.ResponseWriter, r *http.Request, target string) int {
+	// WebSocket upgrade requests need raw TCP proxying
+	if isWebSocketUpgrade(r) {
+		return proxyWebSocket(w, r, target)
+	}
+
 	// Simple reverse proxy using stdlib
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -1277,7 +1409,39 @@ setInterval(refresh, 5000);
 var (
 	startTime    time.Time
 	loadedConfig Config
+	configMu     sync.RWMutex
 )
+
+// configWatcher polls bastion.json for changes and hot-reloads the service list.
+// TLS and dashboard password changes still require a restart.
+func configWatcher(proxy *ReverseProxy) {
+	var lastMod time.Time
+	if info, err := os.Stat("bastion.json"); err == nil {
+		lastMod = info.ModTime()
+	}
+	for {
+		time.Sleep(5 * time.Second)
+		info, err := os.Stat("bastion.json")
+		if err != nil {
+			continue
+		}
+		if !info.ModTime().After(lastMod) {
+			continue
+		}
+		lastMod = info.ModTime()
+		cfg, err := loadConfig()
+		if err != nil {
+			log.Printf("Config reload failed: %v", err)
+			continue
+		}
+		configMu.Lock()
+		loadedConfig.Domain = cfg.Domain
+		loadedConfig.Services = cfg.Services
+		configMu.Unlock()
+		proxy.UpdateServices(cfg.Services)
+		log.Printf("Config reloaded: %d services", len(cfg.Services))
+	}
+}
 
 func startBastion() {
 	cfg, err := loadConfig()
@@ -1296,6 +1460,9 @@ func startBastion() {
 	metrics := NewMetricsCollector()
 	rateLimiter := NewRateLimiter(100, time.Minute)
 	proxy := NewReverseProxy(cfg.Services, metrics, rateLimiter, reqDB)
+
+	// Start config hot-reload watcher
+	go configWatcher(proxy)
 
 	// Initialize WAF engine
 	wafCfg := waf.DefaultConfig()
