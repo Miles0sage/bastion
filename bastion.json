@@ -35,5 +35,10 @@
   "tls": {
     "enabled": true,
     "cert_dir": "/root/bastion/.bastion-certs"
+  },
+  "alerts": {
+    "enabled": true,
+    "webhook_url": "",
+    "check_interval_seconds": 60
   }
 }
